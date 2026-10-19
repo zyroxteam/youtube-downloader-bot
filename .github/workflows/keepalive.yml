@@ -1,0 +1,29 @@
+name: Keep bot awake (Antideploy)
+
+# Antideploy/Fly auto-stops idle machines. A Telegram bot gets no
+# inbound HTTP, so this external ping (plus in-bot self-ping and the
+# Antideploy cron) keeps https://suma.antideploy.app awake.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping health endpoint
+        run: |
+          for i in 1 2 3; do
+            if curl -fsS -m 50 https://suma.antideploy.app/ ; then
+              echo " <- awake"
+              exit 0
+            fi
+            echo "retry $i failed, waiting..."
+            sleep 10
+          done
+          echo "Health endpoint did not respond after retries" >&2
+          exit 1

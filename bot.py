@@ -21,6 +21,12 @@ import urllib.request
 import urllib.parse
 import json
 import html
+import shutil
+import subprocess
+import base64
+import zipfile
+import threading
+import platform as _platform
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -47,6 +53,13 @@ FORCE_CHANNELS = [
     if c.strip()
 ]
 FORCE_JOIN_ENABLED = os.environ.get("FORCE_JOIN", "on").strip().lower() in ("on", "1", "true", "yes")
+
+# ===== Keep-alive (Antideploy/Fly auto-stop fix) =====
+KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "https://suma.antideploy.app/").strip()
+try:
+    KEEPALIVE_SECONDS = max(60, int(os.environ.get("KEEPALIVE_SECONDS", "180")))
+except ValueError:
+    KEEPALIVE_SECONDS = 180
 CHANNEL_LINKS = [f"https://t.me/{c}" for c in FORCE_CHANNELS]
 
 if not all([API_ID, API_HASH, BOT_TOKEN]):
@@ -55,6 +68,10 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/ytdl")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 DB_PATH = os.environ.get("DB_PATH", "/tmp/ytdl/bot.db")
+COOKIE_DIR = "/tmp/zt_cookies"
+os.makedirs(COOKIE_DIR, exist_ok=True)
+COOKIE_PATH = os.path.join(COOKIE_DIR, "cookies.txt")
+DENO_DIR = os.environ.get("DENO_DIR", "/tmp/deno-bin")
 
 URL_RE = re.compile(r"https?://[^\s]+")
 pending = {}
@@ -173,18 +190,282 @@ def run_health_server():
     except Exception as e:
         log.warning("health: %s", e)
 
+# ============ keep-alive ============
+def run_keepalive():
+    if not KEEPALIVE_URL:
+        return
+    log.info("keepalive: pinging %s every %ss", KEEPALIVE_URL, KEEPALIVE_SECONDS)
+    while True:
+        time.sleep(KEEPALIVE_SECONDS)
+        try:
+            req = urllib.request.Request(
+                KEEPALIVE_URL, headers={"User-Agent": "zyrox-keepalive/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                resp.read(32)
+            log.debug("keepalive ok")
+        except Exception as e:
+            log.warning("keepalive ping failed: %s", e)
+
+# ============ cookies (YouTube datacenter bot-check fix) ============
+def get_cookiefile():
+    """Cookies.txt path if configured (env or owner-uploaded); never logs contents."""
+    try:
+        env_path = os.environ.get("YT_COOKIE_FILE", "").strip()
+        if env_path and os.path.isfile(env_path) and os.path.getsize(env_path) > 0:
+            return env_path
+        if os.path.isfile(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 0:
+            return COOKIE_PATH
+        raw = None
+        b64 = os.environ.get("YT_COOKIES_B64", "").strip()
+        if b64:
+            try:
+                raw = base64.b64decode(b64).decode("utf-8", "ignore")
+            except Exception:
+                log.warning("YT_COOKIES_B64 could not be decoded")
+        elif os.environ.get("YT_COOKIES"):
+            raw = os.environ["YT_COOKIES"]
+        if raw:
+            with open(COOKIE_PATH, "w", encoding="utf-8") as fh:
+                fh.write(raw)
+            try: os.chmod(COOKIE_PATH, 0o600)
+            except OSError: pass
+            log.info("YouTube cookies configured from env (%s bytes)", len(raw))
+            return COOKIE_PATH
+    except Exception as e:
+        log.warning("cookie setup failed: %s", e)
+    return None
+
+# ============ JS runtime (deno) for yt-dlp YouTube challenges ============
+_DENO_LOCK = threading.Lock()
+_DENO_STATE = {"tried": False, "runtime": None, "path": None}
+
+def _verify_runtime(name, path):
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=15)
+        ver = ((out.stdout or out.stderr or "").strip().splitlines() or ["?"])[0][:80]
+        if out.returncode == 0:
+            log.info("JS runtime ready: %s (%s) at %s", name, ver, path)
+            return True
+    except Exception as e:
+        log.warning("JS runtime verify failed for %s: %s", path, e)
+    return False
+
+def ensure_js_runtime():
+    """Find a JS runtime, or download deno once (buildpack hosts w/o Dockerfile)."""
+    if _DENO_STATE["tried"]:
+        return _DENO_STATE["runtime"], _DENO_STATE["path"]
+    with _DENO_LOCK:
+        if _DENO_STATE["tried"]:
+            return _DENO_STATE["runtime"], _DENO_STATE["path"]
+        _DENO_STATE["tried"] = True
+        # deno first — yt-dlp's EJS needs deno, or node >= 22 (node 20 is unsupported)
+        found = shutil.which("deno")
+        if found and _verify_runtime("deno", found):
+            _DENO_STATE.update(runtime="deno", path=found)
+            return "deno", found
+        cand = os.path.join(DENO_DIR, "deno")
+        if os.path.isfile(cand) and _verify_runtime("deno", cand):
+            _DENO_STATE.update(runtime="deno", path=cand)
+            return "deno", cand
+        if os.environ.get("AUTO_INSTALL_DENO", "on").strip().lower() in ("off", "0", "false"):
+            log.warning("No JS runtime found and AUTO_INSTALL_DENO is off; YouTube may fail")
+            return None, None
+        try:
+            arch = _platform.machine().lower()
+            arch = {"x86_64": "x86_64", "amd64": "x86_64",
+                    "aarch64": "aarch64", "arm64": "aarch64"}.get(arch, "x86_64")
+            ver = os.environ.get("DENO_VERSION", "v2.5.4").strip()
+            dl_url = f"https://dl.deno.land/release/{ver}/deno-{arch}-unknown-linux-gnu.zip"
+            log.info("Downloading deno %s (%s) for yt-dlp JS challenges...", ver, arch)
+            os.makedirs(DENO_DIR, exist_ok=True)
+            zpath = os.path.join(DENO_DIR, "deno.zip")
+            req = urllib.request.Request(dl_url, headers={"User-Agent": "zyrox-bot/1.0"})
+            with urllib.request.urlopen(req, timeout=180) as resp, open(zpath, "wb") as fh:
+                shutil.copyfileobj(resp, fh, length=1024 * 256)
+            with zipfile.ZipFile(zpath) as zf:
+                for member in zf.namelist():
+                    if os.path.basename(member) == "deno":
+                        with zf.open(member) as src, open(cand, "wb") as out:
+                            shutil.copyfileobj(src, out, length=1024 * 256)
+                        break
+            os.remove(zpath)
+            os.chmod(cand, 0o755)
+            if _verify_runtime("deno", cand):
+                os.environ["PATH"] = DENO_DIR + os.pathsep + os.environ.get("PATH", "")
+                _DENO_STATE.update(runtime="deno", path=cand)
+                return "deno", cand
+        except Exception as e:
+            log.warning("deno download failed: %s", e)
+        for name in ("bun", "node"):
+            found2 = shutil.which(name)
+            if not found2 or not _verify_runtime(name, found2):
+                continue
+            if name == "node":
+                try:
+                    _v = subprocess.run([found2, "--version"], capture_output=True,
+                                        text=True, timeout=10).stdout.strip().lstrip("v")
+                    if int(_v.split(".")[0]) < 22:
+                        log.warning("node %s is too old for yt-dlp EJS (need >=22)", _v)
+                        continue
+                except Exception:
+                    continue
+            _DENO_STATE.update(runtime=name, path=found2)
+            return name, found2
+        log.warning("No JS runtime available; YouTube formats may be missing")
+        return None, None
+
+_FFMPEG = {"path": None, "tried": False}
+
+def get_ffmpeg():
+    if _FFMPEG["tried"]:
+        return _FFMPEG["path"]
+    _FFMPEG["tried"] = True
+    found = shutil.which("ffmpeg")
+    if not found:
+        try:
+            import imageio_ffmpeg
+            found = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            log.warning("ffmpeg not found (imageio-ffmpeg: %s)", e)
+            found = None
+    if found:
+        log.info("ffmpeg: %s", found)
+    _FFMPEG["path"] = found
+    return found
+
 # ============ yt-dlp ============
+YT_STRATEGIES = [
+    ("default", None),
+    ("web_embedded", ["web_embedded"]),
+    ("android_vr", ["android_vr"]),
+    ("web_mweb_android", ["web", "mweb", "android"]),
+    ("ios", ["ios"]),
+]
+_YT_HOST_RE = re.compile(r"(youtube\.com|youtu\.be|youtube-nocookie\.com)", re.I)
+
+def _strategy_order(preferred=None, url=""):
+    if url and not _YT_HOST_RE.search(url):
+        return [YT_STRATEGIES[0]]
+    order = list(YT_STRATEGIES)
+    if get_cookiefile():
+        order.sort(key=lambda x: 0 if x[0] in ("web_mweb_android", "default") else 1)
+    if preferred:
+        order.sort(key=lambda x: 0 if x[0] == preferred else 1)
+    return order
+
+def _ydl_base_opts(strategy_clients):
+    opts = {
+        "quiet": True, "no_warnings": False, "noplaylist": True,
+        "socket_timeout": 30, "retries": 3, "extractor_retries": 3,
+        "force_ipv4": True,
+        "remote_components": ["ejs:github"],
+    }
+    runtime, runtime_path = ensure_js_runtime()
+    if runtime and runtime_path:
+        opts["js_runtimes"] = {runtime: {"path": runtime_path}}
+    cookiefile = get_cookiefile()
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+    if strategy_clients:
+        opts["extractor_args"] = {"youtube": {"player_client": list(strategy_clients)}}
+    return opts
+
+def _has_playable(info):
+    if not isinstance(info, dict):
+        return False
+    if info.get("url"):
+        return True
+    for f in info.get("formats") or []:
+        if not f.get("url"):
+            continue
+        if (f.get("ext") or "") in ("mhtml", "html"):
+            continue
+        if str(f.get("format_id", "")).startswith("sb"):
+            continue
+        if (f.get("vcodec") not in (None, "none")) or (f.get("acodec") not in (None, "none")):
+            return True
+    return False
+
 def extract_info(url: str) -> dict:
     import yt_dlp
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
-            "socket_timeout": 30,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}}}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    errors = []
+    is_yt = bool(_YT_HOST_RE.search(url or ""))
+    for name, clients in _strategy_order(url=url):
+        opts = _ydl_base_opts(clients)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info is None:
+                errors.append(f"{name}: no info")
+                continue
+            info["_strategy"] = name
+            if (not is_yt) or _has_playable(info):
+                log.info("yt-dlp extract ok via strategy=%s", name)
+                return info
+            errors.append(f"{name}: no downloadable formats (Sign in to confirm you're not a bot / SABR?)")
+            log.warning("yt-dlp strategy %s returned no playable formats", name)
+        except Exception as e:
+            errors.append(f"{name}: {str(e)[:220]}")
+            log.warning("yt-dlp extract failed strategy=%s: %s", name, str(e)[:300])
+    raise RuntimeError(" || ".join(errors)[:900] or "Could not fetch video info")
 
-def download_media(url, format_id, progress_cb=None):
+def _format_fallbacks(format_id, is_audio):
+    selectors = [format_id]
+    if is_audio:
+        selectors += ["bestaudio/best/b", "ba/b/best"]
+    else:
+        m = re.search(r"height<=(\d+)", format_id or "")
+        if m:
+            h = m.group(1)
+            selectors += [f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b/best",
+                          "b/best", "18/b"]
+        else:
+            selectors += ["bv*+ba/b/best", "b/best", "18/b"]
+    seen, out = set(), []
+    for sel in selectors:
+        if sel not in seen:
+            seen.add(sel); out.append(sel)
+    return out
+
+def _find_downloaded_file(before, opts, info):
+    after = set(os.listdir(DOWNLOAD_DIR))
+    new_files = [os.path.join(DOWNLOAD_DIR, f) for f in (after - before)]
+    bad_ext = {".mhtml", ".html", ".part", ".ytdl", ".tmp", ".temp"}
+    new_files = [f for f in new_files
+                 if os.path.isfile(f) and os.path.getsize(f) > 1024
+                 and os.path.splitext(f)[1].lower() not in bad_ext]
+    if new_files:
+        return max(new_files, key=os.path.getsize)
     import yt_dlp
-    import glob
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl2:
+            guess = ydl2.prepare_filename(info)
+    except Exception:
+        return None
+    for cand in [guess, os.path.splitext(guess)[0] + ".mp4",
+                 os.path.splitext(guess)[0] + ".mp3",
+                 os.path.splitext(guess)[0] + ".mkv",
+                 os.path.splitext(guess)[0] + ".webm"]:
+        if os.path.isfile(cand) and os.path.getsize(cand) > 1024:
+            return cand
+    return None
+
+def _cleanup_new_files(before):
+    try:
+        after = set(os.listdir(DOWNLOAD_DIR))
+        for name in (after - before):
+            fp = os.path.join(DOWNLOAD_DIR, name)
+            try:
+                if os.path.isfile(fp):
+                    os.remove(fp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+def download_media(url, format_id, progress_cb=None, preferred_strategy=None):
+    import yt_dlp
+
     def hook(d):
         if progress_cb and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
@@ -192,45 +473,69 @@ def download_media(url, format_id, progress_cb=None):
             if total:
                 try: progress_cb(done/total, d.get("speed") or 0, d.get("eta"), done, total)
                 except Exception: pass
-    is_audio = format_id.startswith("bestaudio")
-    # snapshot files before download to find the new file reliably
-    before = set(os.listdir(DOWNLOAD_DIR))
-    opts = {
-        "format": format_id,
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        "noplaylist": True, "quiet": True, "no_warnings": True,
-        "socket_timeout": 60, "retries": 3, "progress_hooks": [hook],
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-    }
-    if is_audio:
-        opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
-                                   "preferredcodec": "mp3",
-                                   "preferredquality": "192"}]
-    else:
-        opts["merge_output_format"] = "mp4"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        title = info.get("title", "video")
 
-    # find the actual downloaded file (robust against merge/rename)
-    after = set(os.listdir(DOWNLOAD_DIR))
-    new_files = [os.path.join(DOWNLOAD_DIR, f) for f in (after - before)]
-    # filter out tiny/empty files and pick the largest
-    new_files = [f for f in new_files
-                 if os.path.isfile(f) and os.path.getsize(f) > 1024]
-    if not new_files:
-        # fallback: try prepare_filename variants
-        with yt_dlp.YoutubeDL(opts) as ydl2:
-            guess = ydl2.prepare_filename(info)
-        for cand in [guess, os.path.splitext(guess)[0] + ".mp4",
-                     os.path.splitext(guess)[0] + ".mp3",
-                     os.path.splitext(guess)[0] + ".mkv"]:
-            if os.path.isfile(cand) and os.path.getsize(cand) > 1024:
-                return cand, title, info
-        raise FileNotFoundError(
-            "Download finished but no file found. The site may have blocked it.")
-    path = max(new_files, key=os.path.getsize)
-    return path, title, info
+    is_audio = format_id.startswith("bestaudio")
+    selectors = _format_fallbacks(format_id, is_audio)
+    strategies = _strategy_order(preferred=preferred_strategy, url=url)
+    errors = []
+
+    for si, (sname, clients) in enumerate(strategies):
+        sels = selectors if si == 0 else [selectors[0], selectors[-1]]
+        for sel in dict.fromkeys(sels):
+            before = set(os.listdir(DOWNLOAD_DIR))
+            opts = _ydl_base_opts(clients)
+            opts["socket_timeout"] = 60
+            opts.update({
+                "format": sel,
+                "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+                "progress_hooks": [hook],
+            })
+            ff = get_ffmpeg()
+            if ff:
+                opts["ffmpeg_location"] = ff
+            if is_audio:
+                if ff:
+                    opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
+                                               "preferredcodec": "mp3",
+                                               "preferredquality": "192"}]
+            else:
+                opts["merge_output_format"] = "mp4"
+            try:
+                log.info("yt-dlp download attempt strategy=%s format=%s", sname, sel)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                title = (info or {}).get("title", "video")
+                path = _find_downloaded_file(before, opts, info)
+                if not path:
+                    raise FileNotFoundError(
+                        "Download finished but no media file found (site may have blocked it)")
+                log.info("yt-dlp download ok strategy=%s format=%s file=%s",
+                         sname, sel, os.path.basename(path))
+                return path, title, info
+            except Exception as e:
+                em = str(e)
+                errors.append(f"{sname}/{sel}: {em[:180]}")
+                log.warning("yt-dlp attempt failed strategy=%s format=%s: %s",
+                            sname, sel, em[:300])
+                _cleanup_new_files(before)
+                low = em.lower()
+                if "sign in to confirm" in low or "login_required" in low:
+                    break
+                continue
+    raise RuntimeError(" || ".join(errors)[:950] or "Download failed")
+
+
+def ytdl_error_hint(em):
+    low = (em or "").lower()
+    if "sign in to confirm" in low or "login_required" in low:
+        return ("\n\n💡 YouTube server IP par login maang raha hai. "
+                "Owner ko bot me cookies.txt set karni padegi "
+                "(owner: /cookies bhejkar file bhejo), phir download chalega.")
+    if "requested format is not available" in low:
+        return "\n\n💡 Is quality ka format nahi mila — 360p ya Audio try karo."
+    if "403" in low:
+        return "\n\n💡 YouTube ne 403 block kiya — thodi der baad dobara try karo."
+    return ""
 
 def fmt_views(n):
     if not n: return "N/A"
@@ -789,8 +1094,8 @@ async def url_handler(_, m: Message):
     info = await asyncio.to_thread(_info)
     if "_error" in info:
         err = info["_error"]
-        hint = "\n\n💡 YouTube is rate-limiting — try again shortly." if "403" in err else ""
-        await status.edit_text(f"❌ <b>Could not fetch video.</b>\n<code>{err[:250]}</code>{hint}")
+        hint = ytdl_error_hint(err)
+        await status.edit_text(f"❌ <b>Could not fetch video.</b>\n<code>{html.escape(err[:350])}</code>{hint}")
         return
 
     title = info.get("title", "Unknown")
@@ -803,7 +1108,7 @@ async def url_handler(_, m: Message):
                     "uploader": uploader, "width": info.get("width"),
                     "height": info.get("height"),
                     "view_count": info.get("view_count"),
-                    "like_count": info.get("like_count"), "sizes": sizes}
+                    "like_count": info.get("like_count"), "sizes": sizes, "strategy": info.get("_strategy")}
     buttons = []
     for i, (lbl, _) in enumerate(QUALITY_OPTIONS):
         sz = sizes[i] if i < len(sizes) else 0
@@ -896,15 +1201,14 @@ async def quality_cb(_, q: CallbackQuery):
     async def _run():
         try:
             path, real_title, info = await asyncio.to_thread(
-                download_media, url, fmt, progress_cb)
+                download_media, url, fmt, progress_cb, data.get("strategy"))
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.exception("download failed")
             em = str(e)
-            hint = ("\n\n💡 YouTube blocked this (403). Try again later."
-                    if "403" in em else "")
-            await safe_edit(f"❌ <b>Download failed.</b>\n<code>{em[:250]}</code>{hint}")
+            hint = ytdl_error_hint(em)
+            await safe_edit(f"❌ <b>Download failed.</b>\n<code>{html.escape(em[:350])}</code>{hint}")
             pending.pop(key, None); return
         # validate file before upload
         if not os.path.isfile(path) or os.path.getsize(path) < 1024:
@@ -1010,6 +1314,48 @@ async def cancel_cb(_, q: CallbackQuery):
 async def noop_cb(_, q: CallbackQuery):
     await q.answer("Open the channel and join.", show_alert=True)
 
+@app.on_message(filters.command("cookies"))
+async def cookies_cmd(_, m: Message):
+    uid = m.from_user.id if m.from_user else 0
+    if not is_owner_uid(uid):
+        return
+    cf = get_cookiefile()
+    status = f"✅ Cookies set hain ({os.path.getsize(cf)} bytes)" if cf else "❌ Cookies set nahi hain"
+    await m.reply_text(
+        f"🍪 <b>YouTube Cookies</b>\n\n{status}\n\n"
+        "Nayi cookies lagane ke liye is chat me <b>cookies.txt</b> file bhej do "
+        "(Netscape format, burner/dusre Google account se export ki hui).\n"
+        "Main account ki cookies mat use karna.")
+
+@app.on_message(filters.document & filters.private)
+async def cookies_doc_handler(_, m: Message):
+    uid = m.from_user.id if m.from_user else 0
+    if not is_owner_uid(uid) or not m.document:
+        return
+    name = (m.document.file_name or "").lower()
+    if "cookie" not in name:
+        return
+    if (m.document.file_size or 0) > 2 * 1024 * 1024:
+        await m.reply_text("❌ Cookies file bahut badi hai (max 2 MB).")
+        return
+    try:
+        tmp_path = await m.download()
+        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(100_000)
+        if "youtube" not in head.lower() and ".google." not in head.lower():
+            try: os.remove(tmp_path)
+            except OSError: pass
+            await m.reply_text("❌ Yeh valid YouTube cookies.txt nahi lagti (Netscape format chahiye).")
+            return
+        shutil.move(tmp_path, COOKIE_PATH)
+        try: os.chmod(COOKIE_PATH, 0o600)
+        except OSError: pass
+        log.info("YouTube cookies updated by owner upload (%s bytes)", os.path.getsize(COOKIE_PATH))
+        await m.reply_text("✅ <b>Cookies save ho gayi!</b> Ab YouTube link dobara bhejo.")
+    except Exception as e:
+        log.exception("cookies upload failed")
+        await m.reply_text(f"❌ Cookies save nahi hui: <code>{html.escape(str(e)[:200])}</code>")
+
 @app.on_message(filters.command("ping"))
 async def ping_cmd(_, m: Message):
     if not OWNER_ID or (m.from_user and m.from_user.id == OWNER_ID):
@@ -1021,5 +1367,14 @@ if __name__ == "__main__":
     init_db()
     setup_menu_button()
     Thread(target=run_health_server, daemon=True).start()
+    Thread(target=ensure_js_runtime, daemon=True).start()
+    Thread(target=run_keepalive, daemon=True).start()
+    try:
+        import yt_dlp as _y
+        log.info("diagnostics: yt-dlp=%s ffmpeg=%s cookies=%s keepalive=%s",
+                 _y.version.__version__, bool(get_ffmpeg()),
+                 bool(get_cookiefile()), KEEPALIVE_URL or "off")
+    except Exception as _e:
+        log.warning("diagnostics failed: %s", _e)
     log.info("starting Zyrox downloader bot | force-join channels: %s (enabled=%s)", FORCE_CHANNELS, FORCE_JOIN_ENABLED)
     app.run()
