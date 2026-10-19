@@ -1,5 +1,7 @@
 """
-Video Downloader Telegram Bot v4 — Button-based UI
+Zyrox Video Downloader Telegram Bot v5 — Button-based UI
+- Force Join: @ZyroxV1 + @ZyroxMod
+- Live download/upload progress bar with %, thumbnail, size & length
 
 - Pyrogram (MTProto) + yt-dlp, large files via MTProto
 - YouTube 403 bypass via Android player client
@@ -18,6 +20,7 @@ import sqlite3
 import urllib.request
 import urllib.parse
 import json
+import html
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -35,6 +38,16 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+
+# ===== Force Join (Zyrox channels) =====
+# Override with env: FORCE_JOIN_CHANNELS="ZyroxV1,ZyroxMod"  FORCE_JOIN=on/off
+FORCE_CHANNELS = [
+    c.strip().lstrip("@")
+    for c in os.environ.get("FORCE_JOIN_CHANNELS", "ZyroxV1,ZyroxMod").split(",")
+    if c.strip()
+]
+FORCE_JOIN_ENABLED = os.environ.get("FORCE_JOIN", "on").strip().lower() in ("on", "1", "true", "yes")
+CHANNEL_LINKS = [f"https://t.me/{c}" for c in FORCE_CHANNELS]
 
 if not all([API_ID, API_HASH, BOT_TOKEN]):
     raise SystemExit("Missing API_ID / API_HASH / BOT_TOKEN env vars")
@@ -177,7 +190,7 @@ def download_media(url, format_id, progress_cb=None):
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes", 0)
             if total:
-                try: progress_cb(done/total, d.get("speed") or 0, d.get("eta"))
+                try: progress_cb(done/total, d.get("speed") or 0, d.get("eta"), done, total)
                 except Exception: pass
     is_audio = format_id.startswith("bestaudio")
     # snapshot files before download to find the new file reliably
@@ -231,8 +244,13 @@ def fmt_dur(s):
     s=int(s); h,r=divmod(s,3600); m,sec=divmod(r,60)
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
-def bar(frac, w=12):
-    f=int(frac*w); return "█"*f+"░"*(w-f)
+def bar(frac, w=18):
+    try:
+        frac = max(0.0, min(1.0, float(frac or 0)))
+    except Exception:
+        frac = 0
+    f = int(round(frac * w))
+    return "█" * f + "░" * (w - f)
 
 def fmt_speed(bps):
     if not bps: return "—"
@@ -240,6 +258,101 @@ def fmt_speed(bps):
         if bps<1024: return f"{bps:.1f} {u}"
         bps/=1024
     return f"{bps:.1f} GB/s"
+
+def fmt_size(num):
+    """Bytes -> 12.4 MB style."""
+    if not num:
+        return "N/A"
+    try:
+        num = float(num)
+    except Exception:
+        return "N/A"
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024:
+            return f"{num:.1f} {unit}" if unit != "B" else f"{int(num)} B"
+        num /= 1024
+    return f"{num:.1f} TB"
+
+def fmt_eta(sec):
+    if sec is None:
+        return "—"
+    try:
+        sec = int(sec)
+    except Exception:
+        return "—"
+    if sec < 0:
+        return "—"
+    m, s_ = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s_:02d}" if h else f"{m}:{s_:02d}"
+
+def _format_size(fmt, duration):
+    size = fmt.get("filesize") or fmt.get("filesize_approx")
+    if size:
+        return int(size)
+    tbr = fmt.get("tbr") or ((fmt.get("vbr") or 0) + (fmt.get("abr") or 0))
+    if tbr and duration:
+        return int(float(tbr) * 1000 / 8 * float(duration))
+    return 0
+
+def estimate_sizes(info):
+    """Approx size per QUALITY_OPTIONS entry -> list of byte counts (0=unknown)."""
+    try:
+        duration = info.get("duration") or 0
+        formats = info.get("formats") or []
+        audio_sizes = [
+            _format_size(f, duration) for f in formats
+            if (f.get("vcodec") in (None, "none")) and f.get("acodec") not in (None, "none")
+        ]
+        best_audio = max(audio_sizes) if audio_sizes else 0
+
+        def for_height(limit):
+            cands = []
+            for f in formats:
+                if f.get("vcodec") in (None, "none"):
+                    continue
+                h = f.get("height") or 0
+                if limit and h and h > limit:
+                    continue
+                size = _format_size(f, duration)
+                if f.get("acodec") in (None, "none"):
+                    size += best_audio
+                cands.append((h, f.get("tbr") or 0, size))
+            if not cands:
+                return 0
+            cands.sort(key=lambda x: (x[0], x[1]))
+            return cands[-1][2]
+
+        return [for_height(360), for_height(720), for_height(1080), for_height(None), best_audio]
+    except Exception:
+        return [0, 0, 0, 0, 0]
+
+def pick_thumbnail(info):
+    thumbs = info.get("thumbnails") or []
+    jpg = [t.get("url") for t in thumbs if (t.get("url") or "").lower().split("?")[0].endswith((".jpg", ".jpeg"))]
+    if jpg:
+        return jpg[-1]
+    return info.get("thumbnail")
+
+def download_thumbnail(thumb_url, video_id="thumb"):
+    """Download thumbnail locally so it can be attached to the uploaded video/audio."""
+    if not thumb_url:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(video_id))[:40] or "thumb"
+    path = os.path.join(DOWNLOAD_DIR, f"thumb_{safe}_{int(time.time())}.jpg")
+    try:
+        req = urllib.request.Request(
+            thumb_url, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read(8 * 1024 * 1024)
+        if len(data) < 1024:
+            return None
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+    except Exception as e:
+        log.warning("thumbnail download failed: %s", e)
+        return None
 
 # ============ menu button (Telegram side menu) ============
 def setup_menu_button():
@@ -276,6 +389,8 @@ def is_owner_uid(uid):
 # ----- keyboards -----
 def main_menu_kb(uid):
     rows = [
+        [InlineKeyboardButton("📢 @ZyroxV1", url="https://t.me/ZyroxV1"),
+         InlineKeyboardButton("📢 @ZyroxMod", url="https://t.me/ZyroxMod")],
         [InlineKeyboardButton("❓ Help", callback_data="menu:help")],
     ]
     if is_owner_uid(uid):
@@ -309,29 +424,57 @@ def channels_kb():
     return InlineKeyboardMarkup(rows)
 
 WELCOME = (
-    "👋 <b>Welcome to Video Downloader Bot</b>\n\n"
-    "Send me a video link and I'll download it for you.\n\n"
-    "✅ YouTube + 1000+ sites\n"
+    "🚀 <b>Welcome to Zyrox YouTube Downloader Bot</b>\n\n"
+    "Send me a YouTube / video link and I will download it for you.\n\n"
+    "✅ 360p / 720p / 1080p / Best / Audio MP3\n"
+    "✅ Live download + upload progress with %\n"
+    "✅ Thumbnail, file size & video length shown\n"
     "✅ Large files via MTProto — no 50MB limit\n\n"
-    "Just paste a link to get started! 🚀"
+    "📢 <b>Our Channels:</b> @ZyroxV1 • @ZyroxMod\n\n"
+    "Just paste a link to get started! 🔥"
 )
 HELP_TEXT = (
     "📖 <b>How to use</b>\n\n"
-    "1️⃣ Send a video URL\n"
-    "2️⃣ Choose quality\n"
-    "3️⃣ Wait for download & upload\n\n"
+    "1️⃣ Join @ZyroxV1 and @ZyroxMod\n"
+    "2️⃣ Send a video URL\n"
+    "3️⃣ See thumbnail, size & length, then choose quality\n"
+    "4️⃣ Watch live progress bar with % while it downloads & uploads\n\n"
     "💡 Tip: use 🛑 Cancel to stop a download."
 )
 
 async def check_force_join(uid):
-    if get_setting("fjoin", "off") != "on":
+    """User must join @ZyroxV1 + @ZyroxMod (and any admin-added DB channels)."""
+    if is_owner_uid(uid):
+        return True, []
+    if not FORCE_JOIN_ENABLED and get_setting("fjoin", "off") != "on":
         return True, []
     missing = []
+    seen = set()
+    # 1) Hardcoded / env public channels: @ZyroxV1, @ZyroxMod
+    for username in FORCE_CHANNELS:
+        key = username.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            member = await app.get_chat_member(f"@{username}", uid)
+            status = str(getattr(member, "status", "")).lower()
+            if any(x in status for x in ("left", "banned", "kicked")):
+                raise UserNotParticipant("not joined")
+        except Exception:
+            missing.append({
+                "chat_id": f"@{username}",
+                "title": f"@{username}",
+                "invite_link": f"https://t.me/{username}",
+            })
+    # 2) Extra channels added from Admin Panel (database)
     for ch in get_channels():
         try:
             await app.get_chat_member(ch["chat_id"], uid)
         except Exception:
-            missing.append(dict(ch))
+            d = dict(ch)
+            if str(d.get("chat_id", "")).lower() not in seen and str(d.get("title", "")).lower().lstrip("@") not in seen:
+                missing.append(d)
     return (len(missing) == 0), missing
 
 def join_kb(missing):
@@ -653,13 +796,32 @@ async def url_handler(_, m: Message):
     title = info.get("title", "Unknown")
     uploader = info.get("uploader") or info.get("channel") or "Unknown"
     key = f"{m.chat.id}:{m.id}"
+    sizes = estimate_sizes(info)
     pending[key] = {"url": info.get("webpage_url", url), "title": title,
-                    "thumb": info.get("thumbnail")}
-    buttons = [[InlineKeyboardButton(lbl, callback_data=f"q|{key}|{i}")]
-               for i, (lbl, _) in enumerate(QUALITY_OPTIONS)]
-    caption = (f"🎬 <b>{title}</b>\n\n👤 {uploader}\n"
-               f"⏱️ {fmt_dur(info.get('duration'))} • 👁️ {fmt_views(info.get('view_count'))}\n\n"
-               "<b>Select quality:</b>")
+                    "thumb": pick_thumbnail(info), "thumb_url": pick_thumbnail(info),
+                    "id": info.get("id"), "duration": info.get("duration"),
+                    "uploader": uploader, "width": info.get("width"),
+                    "height": info.get("height"),
+                    "view_count": info.get("view_count"),
+                    "like_count": info.get("like_count"), "sizes": sizes}
+    buttons = []
+    for i, (lbl, _) in enumerate(QUALITY_OPTIONS):
+        sz = sizes[i] if i < len(sizes) else 0
+        text = f"{lbl} • {fmt_size(sz)}" if sz else lbl
+        buttons.append([InlineKeyboardButton(text, callback_data=f"q|{key}|{i}")])
+    _res = f"{info.get('width')}x{info.get('height')}" if info.get("width") and info.get("height") else "N/A"
+    _likes = f" • ❤️ {fmt_views(info.get('like_count'))}" if info.get("like_count") else ""
+    _size_lines = "\n".join(
+        f"{lbl}: <b>{fmt_size(sizes[i])}</b>" for i, (lbl, _) in enumerate(QUALITY_OPTIONS) if i < len(sizes) and sizes[i])
+    caption = (
+        f"🎬 <b>{html.escape(str(title))[:220]}</b>\n\n"
+        f"👤 <b>Channel:</b> {html.escape(str(uploader))}\n"
+        f"⏱️ <b>Length:</b> {fmt_dur(info.get('duration'))} ({int(info.get('duration') or 0)} sec)\n"
+        f"🖥️ <b>Resolution:</b> {_res}\n"
+        f"👁️ <b>Views:</b> {fmt_views(info.get('view_count'))}{_likes}\n"
+        + (f"📦 <b>Estimated Size:</b>\n{_size_lines}\n" if _size_lines else "")
+        + "\n<b>Select quality:</b>"
+    )[:1000]
     try:
         if pending[key]["thumb"]:
             await status.delete()
@@ -689,26 +851,46 @@ async def quality_cb(_, q: CallbackQuery):
     is_audio = "Audio" in label
     cancel_btn = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🛑 Cancel", callback_data=f"x|{key}")]])
-    await q.message.edit_text(
-        f"⬇️ <b>Downloading</b>\n📌 {title}\n🎚️ {label}\n\n<i>Starting…</i>",
-        reply_markup=cancel_btn)
+    _start_txt = f"⬇️ <b>Downloading</b>\n📌 {html.escape(str(title))[:200]}\n🎚️ {label}\n\n<i>Starting…</i>"
+    try:
+        await q.message.edit_text(_start_txt, reply_markup=cancel_btn)
+        status_msg = q.message
+    except Exception:
+        # Original message is a photo (thumbnail) -> edit_text fails, replace it
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        status_msg = await app.send_message(q.message.chat.id, _start_txt, reply_markup=cancel_btn)
 
     loop = asyncio.get_event_loop()
     last = 0.0
-    st = {"msg": q.message}
+    st = {"msg": status_msg}
 
     async def safe_edit(text, markup=None):
         try: await st["msg"].edit_text(text, reply_markup=markup)
         except Exception: pass
 
-    def progress_cb(frac, speed, eta):
+    _dl_t0 = time.time()
+
+    def progress_cb(frac, speed, eta, done=0, total=0):
         nonlocal last
         now = time.time()
-        if now - last < 4: return
+        if now - last < 3 and frac < 1:
+            return
         last = now
-        pct = int(frac * 100)
-        txt = (f"⬇️ <b>Downloading</b>\n📌 {title}\n🎚️ {label}\n\n"
-               f"{bar(frac)} {pct}%\n⚡ {fmt_speed(speed)} • ⏳ ETA {int(eta) if eta else '—'}s")
+        pct = frac * 100
+        elapsed = now - _dl_t0
+        done_txt = f"{fmt_size(done)} / {fmt_size(total)}" if total else fmt_size(done)
+        txt = (
+            f"⬇️ <b>Downloading…</b>\n"
+            f"📌 {html.escape(str(title))[:160]}\n"
+            f"🎚️ {label}\n\n"
+            f"<code>{bar(frac)}</code> <b>{pct:.1f}%</b>\n"
+            f"📦 {done_txt}\n"
+            f"⚡ <b>Speed:</b> {fmt_speed(speed)} • ⏳ <b>ETA:</b> {fmt_eta(eta)}\n"
+            f"⏱️ <b>Elapsed:</b> {fmt_eta(elapsed)}"
+        )
         asyncio.run_coroutine_threadsafe(safe_edit(txt, cancel_btn), loop)
 
     async def _run():
@@ -729,28 +911,68 @@ async def quality_cb(_, q: CallbackQuery):
             await safe_edit("❌ <b>Download failed.</b>\nFile is missing or empty. "
                             "The site may have blocked the download.")
             pending.pop(key, None); return
-        size_mb = os.path.getsize(path) / (1024 * 1024)
-        await safe_edit(f"⬆️ <b>Uploading</b>\n📌 {real_title}\n📦 {size_mb:.1f} MB\n\n<i>Please wait…</i>")
-        caption = f"🎬 <b>{real_title}</b>\n🎚️ {label} • 📦 {size_mb:.1f} MB"
+        file_size = os.path.getsize(path)
+        size_mb = file_size / (1024 * 1024)
+        duration = int(info.get("duration") or data.get("duration") or 0) or None
+        res_txt = ""
+        if info.get("width") and info.get("height"):
+            res_txt = f" • 🖥️ {info.get('width')}x{info.get('height')}"
+        await safe_edit(
+            f"⬆️ <b>Uploading…</b>\n📌 {html.escape(str(real_title))[:160]}\n"
+            f"📦 {fmt_size(file_size)} • ⏱️ {fmt_dur(duration)}\n\n"
+            f"<code>{bar(0)}</code> <b>0.0%</b>\n<i>Please wait…</i>", cancel_btn)
+
+        _up = {"last": 0.0, "t0": time.time(), "last_bytes": 0, "speed": 0}
+
+        async def upload_progress(current, total):
+            now = time.time()
+            if now - _up["last"] < 3 and current < total:
+                return
+            dt = now - _up["last"] if _up["last"] else 0
+            if dt > 0:
+                _up["speed"] = (current - _up["last_bytes"]) / dt
+            _up["last"] = now
+            _up["last_bytes"] = current
+            frac = (current / total) if total else 0
+            eta = ((total - current) / _up["speed"]) if _up["speed"] else None
+            await safe_edit(
+                f"⬆️ <b>Uploading…</b>\n📌 {html.escape(str(real_title))[:160]}\n"
+                f"🎚️ {label} • ⏱️ {fmt_dur(duration)}\n\n"
+                f"<code>{bar(frac)}</code> <b>{frac * 100:.1f}%</b>\n"
+                f"📦 {fmt_size(current)} / {fmt_size(total)}\n"
+                f"⚡ <b>Speed:</b> {fmt_speed(_up['speed'])} • ⏳ <b>ETA:</b> {fmt_eta(eta)}",
+                cancel_btn)
+
+        caption = (
+            f"🎬 <b>{html.escape(str(real_title))[:250]}</b>\n\n"
+            f"🎚️ <b>Quality:</b> {label}\n"
+            f"📦 <b>Size:</b> {fmt_size(file_size)}\n"
+            f"⏱️ <b>Length:</b> {fmt_dur(duration)}{res_txt}\n\n"
+            f"📢 @ZyroxV1 • @ZyroxMod"
+        )[:1000]
+        thumb_path = await asyncio.to_thread(
+            download_thumbnail, data.get("thumb_url") or data.get("thumb"), data.get("id") or info.get("id") or "thumb")
+        _thumb_kw = {"thumb": thumb_path} if thumb_path else {}
         try:
             if is_audio:
                 await app.send_audio(
                     q.message.chat.id, path, caption=caption,
                     title=real_title[:60],
                     performer=info.get("uploader") or info.get("channel"),
-                    duration=int(info.get("duration") or 0) or None)
+                    duration=duration, progress=upload_progress, **_thumb_kw)
             else:
                 try:
                     await app.send_video(
                         q.message.chat.id, path, caption=caption,
-                        duration=int(info.get("duration") or 0) or None,
+                        duration=duration,
                         width=info.get("width") or None,
-                        height=info.get("height") or None)
+                        height=info.get("height") or None,
+                        supports_streaming=True,
+                        progress=upload_progress, **_thumb_kw)
                 except Exception:
-                    # fallback: send as document if video upload fails
                     log.warning("send_video failed, trying send_document")
                     await app.send_document(q.message.chat.id, path,
-                                            caption=caption)
+                                            caption=caption, progress=upload_progress, **_thumb_kw)
             bump_downloads(q.from_user.id)
             await safe_edit("✅ <b>Done!</b> Enjoy 🎉")
         except Exception as e:
@@ -760,6 +982,11 @@ async def quality_cb(_, q: CallbackQuery):
             pending.pop(key, None); active_tasks.pop(key, None)
             try: os.remove(path)
             except OSError: pass
+            try:
+                if thumb_path:
+                    os.remove(thumb_path)
+            except Exception:
+                pass
 
     task = asyncio.create_task(_run())
     active_tasks[key] = task
@@ -794,5 +1021,5 @@ if __name__ == "__main__":
     init_db()
     setup_menu_button()
     Thread(target=run_health_server, daemon=True).start()
-    log.info("starting downloader bot v4 (button UI)…")
+    log.info("starting Zyrox downloader bot | force-join channels: %s (enabled=%s)", FORCE_CHANNELS, FORCE_JOIN_ENABLED)
     app.run()
